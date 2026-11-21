@@ -33,6 +33,9 @@ const COMMA = 0;
 const LINE_BREAK = 1;
 const END = 2;
 
+/** The next field delimiter: a comma, a CR or an LF, whichever comes first. */
+const DELIM = /[,\r\n]/g;
+
 /** csv-reader 1.0.0's answer for one case's input. */
 export function run(input) {
   const text = String(input.text);
@@ -58,51 +61,39 @@ export function run(input) {
   // Reads unquoted characters onto `value` up to the next comma or line break:
   // a CR not followed by LF is dropped (stray_cr). Returns the field and how it
   // ended; `added` counts the characters kept after `value` was passed in.
+  // One regex finds the nearest delimiter in a single native scan, where three
+  // indexOf calls each scanned ahead on their own.
   function readUnquoted(value) {
     let added = 0;
     while (pos < n) {
-      const nc = text.indexOf(',', pos);
-      const nl = text.indexOf('\n', pos);
-      const nr = text.indexOf('\r', pos);
-      let end = n;
-      let kind = END;
-      if (nc !== -1 && nc < end) {
-        end = nc;
-        kind = COMMA;
-      }
-      if (nl !== -1 && nl < end) {
-        end = nl;
-        kind = LINE_BREAK;
-      }
-      if (nr !== -1 && nr < end) {
-        end = nr;
-        kind = 3; // a CR: CRLF ends the field, a lone one is dropped
-      }
+      DELIM.lastIndex = pos;
+      const m = DELIM.exec(text);
+      const end = m ? m.index : n;
       if (end > pos) {
         value += text.slice(pos, end);
         added += end - pos;
       }
-      if (kind === COMMA) {
+      if (!m) {
+        pos = n;
+        return { value, ended: END, added };
+      }
+      const d = m[0];
+      if (d === ',') {
         pos = end + 1;
         return { value, ended: COMMA, added };
       }
-      if (kind === LINE_BREAK) {
+      if (d === '\n') {
         pos = end + 1;
         line += 1;
         return { value, ended: LINE_BREAK, added };
       }
-      if (kind === 3) {
-        if (text.charCodeAt(end + 1) === 10) {
-          pos = end + 2;
-          line += 1;
-          return { value, ended: LINE_BREAK, added };
-        }
-        error('stray_cr');
-        pos = end + 1;
-        continue;
+      if (text.charCodeAt(end + 1) === 10) {
+        pos = end + 2;
+        line += 1;
+        return { value, ended: LINE_BREAK, added };
       }
-      pos = n;
-      return { value, ended: END, added };
+      error('stray_cr');
+      pos = end + 1;
     }
     return { value, ended: END, added };
   }
@@ -138,25 +129,12 @@ export function run(input) {
     }
     let value = parts.length === 1 ? parts[0] : parts.join('');
     // CRLF and lone CRs inside quotes are each one LF; every line break
-    // inside quotes counts toward the line number.
+    // inside quotes counts toward the line number. replaceAll normalises
+    // them in native code, where a per-character loop was the slow path.
     if (value.indexOf('\r') !== -1) {
-      const out = [];
-      let last = 0;
-      for (let i = 0; i < value.length; i++) {
-        const cc = value.charCodeAt(i);
-        if (cc === 13) {
-          out.push(value.slice(last, i), '\n');
-          line += 1;
-          if (value.charCodeAt(i + 1) === 10) i += 1;
-          last = i + 1;
-        } else if (cc === 10) {
-          out.push(value.slice(last, i), '\n');
-          line += 1;
-          last = i + 1;
-        }
-      }
-      out.push(value.slice(last));
-      value = out.join('');
+      value = value.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+      let idx = -1;
+      while ((idx = value.indexOf('\n', idx + 1)) !== -1) line += 1;
     } else if (value.indexOf('\n') !== -1) {
       let idx = -1;
       while ((idx = value.indexOf('\n', idx + 1)) !== -1) line += 1;
