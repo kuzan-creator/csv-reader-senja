@@ -1,529 +1,523 @@
-// transcode4.js — v4 single-pass streaming transcoder (asm.js-style).
-//
-// Direct emission: fields are written to the output Buffer as they are
-// parsed. No descriptor array, no second emit pass, no closures in the
-// hot path. All hot-loop state lives in locals; helpers are top-level
-// functions taking explicit arguments so V8 can keep the code optimized
-// (zero-deopt asm.js style).
-//
-// Field bytes in the input JSON are already JSON-escaped, and csv-reader's
-// own escaping of a field value is the same escaping, so a field that needs
-// no CSV-level change is copied byte-for-byte from the input Buffer to the
-// output Buffer. Only fields that change bytes (doubled quotes, CR to LF
-// inside quotes, stray CRs, quote junk, unterminated quotes) take the slow
-// byte-level decode.
-//
-// Escapes: the generator only ever emits \"  \n  \r (measured on practice:
-// 300724 / 77715 / 40285, zero \\ and zero \u). Any other escape throws
-// NeedFallback and the caller answers that case with JSON.parse + solve.js.
+// transcode.js — v6: one-pass byte-level JSON-to-JSON CSV transcoder, pure JS.
+// Parses CSV directly from the JSON-escaped bytes of cases.json (no JSON.parse, no decode
+// buffer, no descriptor array). Field bytes are copied verbatim from input to output
+// (input JSON escaping == output JSON escaping) except for the rare transforms
+// ("" -> ", CR -> LF inside quotes, stray CR dropped).
+// Semantik: csv-reader 1.0.0 (vendor). Output per case:
+//   {"columns":...,"rows":[...],"errors":[...]}
 
-export class NeedFallback extends Error {}
-
-const BS = 0x5c;
-const CM = 0x2c;
-const DQ = 0x22;
-const NL = 0x6e;
-const CRB = 0x72;
-
-// SWAR: 32-bit mask, 0x80 in the high bit of every byte that is a
-// backslash (0x5C) or a comma (0x2C).
-function delimMask(w) {
-  const a = w ^ 0x5c5c5c5c;
-  const b = w ^ 0x2c2c2c2c;
-  return ((a - 0x01010101) & ~a & 0x80808080) | ((b - 0x01010101) & ~b & 0x80808080);
+export class NeedFallback extends Error {
+  constructor() { super('NeedFallback'); }
 }
 
-export function makeScanner(raw) {
-  const base = raw.byteOffset;
-  const align = (4 - (base % 4)) % 4;
-  const u32 = new Uint32Array(raw.buffer, base + align, (raw.length - align) >>> 2);
-  return { u32, alignBase: align };
+const BS = 0x5C; // backslash
+const QT = 0x22; // "
+const CM = 0x2C; // ,
+const CN = 0x6E; // n
+const CR = 0x72; // r
+const CU = 0x75; // u
+
+const L_COLS = Buffer.from('{"columns":', 'latin1');
+const L_ROWS = Buffer.from(',"rows":[', 'latin1');
+const L_ERRS = Buffer.from('],"errors":[', 'latin1');
+const L_END = Buffer.from(']}', 'latin1');
+const L_NULL = Buffer.from('null', 'latin1');
+
+// scratch (dipakai ulang antar case; BUKAN di hot path per-field)
+const errBuf = Buffer.allocUnsafe(1048576);
+const rowBuf = Buffer.allocUnsafe(65536);
+const fieldEnds = new Int32Array(64);
+let warmed = false;
+
+// --- tulis bilangan desimal non-negatif ke buffer, return offset baru ---
+function putInt(buf, o, n) {
+  if (n === 0) { buf[o++] = 0x30; return o; }
+  let d = 1;
+  while (d * 10 <= n) d *= 10;
+  while (d >= 1) {
+    buf[o++] = 0x30 + (((n / d) | 0) % 10);
+    d = (d / 10) | 0;
+  }
+  return o;
 }
 
-// Find the next backslash or comma at/after pos, before end.
-// NOTE: SWAR zero-byte test has a borrow false positive (a ',' followed
-// by '-' flags the second byte too), so every candidate is verified
-// against the raw byte and a false positive is skipped.
-function findDelim(raw, u32, alignBase, pos, end) {
-  while (pos < end) {
-    const d = findDelimRaw(u32, alignBase, pos, end);
-    if (d >= end) return end;
-    const b = raw[d];
-    if (b === BS || b === CM) return d;
-    pos = d + 1;
+// --- emit {"code":"..","line":L,"row":R} ke errBuf; return eo baru ---
+// (dipisah ',' otomatis bila bukan error pertama)
+function errSimple(eo, code, line, row) {
+  if (eo > 0) errBuf[eo++] = CM;
+  errBuf[eo++] = 0x7B; // {
+  eo += errBuf.write('"code":"', eo, 'latin1');
+  eo += errBuf.write(code, eo, 'latin1');
+  eo += errBuf.write('","line":', eo, 'latin1');
+  eo = putInt(errBuf, eo, line);
+  eo += errBuf.write(',"row":', eo, 'latin1');
+  if (row === null) eo += errBuf.write('null', eo, 'latin1');
+  else eo = putInt(errBuf, eo, row);
+  errBuf[eo++] = 0x7D; // }
+  return eo;
+}
+
+// --- emit {"code":"short_row","line":L,"row":R,"fields":N} ---
+function errShort(eo, line, row, fields) {
+  if (eo > 0) errBuf[eo++] = CM;
+  errBuf[eo++] = 0x7B;
+  eo += errBuf.write('"code":"short_row","line":', eo, 'latin1');
+  eo = putInt(errBuf, eo, line);
+  eo += errBuf.write(',"row":', eo, 'latin1');
+  if (row === null) eo += errBuf.write('null', eo, 'latin1');
+  else eo = putInt(errBuf, eo, row);
+  eo += errBuf.write(',"fields":', eo, 'latin1');
+  eo = putInt(errBuf, eo, fields);
+  errBuf[eo++] = 0x7D;
+  return eo;
+}
+
+// --- emit {"code":"long_row","line":L,"row":R,"extra":[...]} ---
+// extra = field yang dipotong, dari rowBuf[extraLo..extraHi)
+function errLong(eo, line, row, extraLo, extraHi) {
+  if (eo > 0) errBuf[eo++] = CM;
+  errBuf[eo++] = 0x7B;
+  eo += errBuf.write('"code":"long_row","line":', eo, 'latin1');
+  eo = putInt(errBuf, eo, line);
+  eo += errBuf.write(',"row":', eo, 'latin1');
+  if (row === null) eo += errBuf.write('null', eo, 'latin1');
+  else eo = putInt(errBuf, eo, row);
+  eo += errBuf.write(',"extra":[', eo, 'latin1');
+  errBuf.set(rowBuf.subarray(extraLo, extraHi), eo);
+  eo += extraHi - extraLo;
+  errBuf[eo++] = 0x5D; // ]
+  errBuf[eo++] = 0x7D; // }
+  return eo;
+}
+
+// --- SWAR (byte-position): cari byte CM (,) atau BS (\) berikutnya di raw[p..end). ---
+// Melacak posisi byte (p += 4), BUKAN word-index — menghindari `w << 2` yang
+// tidak punya type feedback dan memicu deopt loop "Insufficient type feedback
+// for binary operation" (v6 awal hang >25 detik di case 1 karenanya).
+function findDelim(raw, u32, p, end) {
+  while (p < end) {
+    const b = raw[p];
+    if (b === CM || b === BS) return p;
+    if ((p & 3) === 0) break;
+    p++;
+  }
+  const pEnd = (end >> 2) << 2;
+  while (p < pEnd) {
+    const word = u32[p >> 2];
+    let x = (word ^ 0x2C2C2C2C) | 0;
+    let h = (((x - 0x01010101) | 0) & ~x & 0x80808080) | 0;
+    x = (word ^ 0x5C5C5C5C) | 0;
+    h |= (((x - 0x01010101) | 0) & ~x & 0x80808080) | 0;
+    if (h !== 0) {
+      for (let i = 0; i < 4; i++) {
+        const b = raw[p + i];
+        if (b === CM || b === BS) return p + i;
+      }
+    }
+    p += 4;
+  }
+  while (p < end) {
+    const b = raw[p];
+    if (b === CM || b === BS) return p;
+    p++;
   }
   return end;
 }
 
-function findDelimRaw(u32, alignBase, pos, end) {
-  if (pos >= end) return end;
-  const startWi = (pos - alignBase) >> 2;
-  const endWi = (end - 1 - alignBase) >> 2;
-  const headOff = pos - (alignBase + (startWi << 2));
-  const firstMask = headOff === 0 ? 0xffffffff : (0x80808080 << (headOff << 3));
-  for (let wi = startWi; wi <= endWi; wi++) {
-    let m = delimMask(u32[wi]);
-    if (wi === startWi) m &= firstMask;
-    if (wi === endWi) {
-      const keep = end - (alignBase + (wi << 2));
-      if (keep < 4) m &= 0x80808080 >>> ((4 - keep) << 3);
+// --- SWAR (byte-position): cari byte 0x5C (\) berikutnya di raw[p..end). ---
+function findBS(raw, u32, p, end) {
+  while (p < end) {
+    if (raw[p] === BS) return p;
+    if ((p & 3) === 0) break;
+    p++;
+  }
+  const pEnd = (end >> 2) << 2;
+  while (p < pEnd) {
+    const word = u32[p >> 2];
+    const x = (word ^ 0x5C5C5C5C) | 0;
+    const h = (((x - 0x01010101) | 0) & ~x & 0x80808080) | 0;
+    if (h !== 0) {
+      for (let i = 0; i < 4; i++) {
+        if (raw[p + i] === BS) return p + i;
+      }
     }
-    if (m !== 0) {
-      const lsb = m & -m;
-      const byteIdx = (31 - Math.clz32(lsb)) >>> 3;
-      return alignBase + (wi << 2) + byteIdx;
-    }
+    p += 4;
+  }
+  while (p < end) {
+    if (raw[p] === BS) return p;
+    p++;
   }
   return end;
 }
 
-// Copy raw[s..e) to out at o, byte by byte. Fastest for the short fields
-// this workload is made of (measured: beats Buffer.copy and out.set).
-function copyRange(raw, s, e, out, o) {
-  for (let i = s; i < e; i++) out[o++] = raw[i];
-  return o;
+// --- salin verbatim raw[fs..fe) ke rowBuf di ro. Return ro baru. ---
+function copyRaw(raw, fs, fe, ro) {
+  for (let i = fs; i < fe; i++) rowBuf[ro++] = raw[i];
+  return ro;
 }
 
-// Decode one slow field's raw bytes [rs, re) into its JSON string.
-// `quoted` says the field opened with a quote (rs is the opening \").
-// Mirrors the reference parser's readQuoted / readUnquoted on raw bytes.
-function slowFieldJSON(raw, rs, re, quoted) {
-  let value = '';
-  if (!quoted) {
-    let i = rs;
-    while (i < re) {
-      if (raw[i] === BS) {
-        const nb = raw[i + 1];
-        if (nb === DQ) { value += '"'; i += 2; }
-        else if (nb === NL) { value += '\n'; i += 2; }
-        else if (nb === CRB) { i += 2; }
-        else if (nb === BS) { value += '\\'; i += 2; }
-        else if (nb === 0x75) {
-          value += String.fromCharCode(parseInt(raw.toString('utf8', i + 2, i + 6), 16));
-          i += 6;
-        } else if (nb === 0x74) { value += '\t'; i += 2; }
-        else if (nb === 0x62) { value += '\b'; i += 2; }
-        else if (nb === 0x66) { value += '\f'; i += 2; }
-        else if (nb === 0x2f) { value += '/'; i += 2; }
-        else throw new NeedFallback();
-      } else {
-        let j = i;
-        while (j < re && raw[j] !== BS) j++;
-        value += raw.toString('utf8', i, j);
-        i = j;
-      }
-    }
-    return JSON.stringify(value);
+// --- salin field unquoted raw[fs..fe) dengan menangani escape JSON inline.
+// Return [roBaru, dirty] — dirty=true bila ada stray CR (error sudah di-emit
+// oleh pemanggil? tidak: pemanggil yang meng-emit stray_cr; di sini dirty
+// hanya penanda ada transformasi). Escape ditangani per unit (\\ dulu) supaya
+// \\r tidak dikira stray CR dan \\" tidak dikira doubled quote.
+function copyUnquotedSlow(raw, fs, fe, ro) {
+  let i = fs;
+  let dirty = false;
+  while (i < fe) {
+    const b = raw[i];
+    if (b !== BS) { rowBuf[ro++] = b; i++; continue; }
+    const c = raw[i + 1];
+    // Output adalah JSON: " \ LF harus dalam bentuk escape (\" \\ \n).
+    if (c === CN) { rowBuf[ro++] = BS; rowBuf[ro++] = CN; i += 2; continue; } // \n -> \n
+    if (c === CR) { dirty = true; i += 2; continue; } // \r -> drop (stray CR)
+    if (c === BS) { rowBuf[ro++] = BS; rowBuf[ro++] = BS; i += 2; continue; } // \\ -> \\
+    if (c === QT) { rowBuf[ro++] = BS; rowBuf[ro++] = QT; i += 2; continue; } // \" -> \"
+    if (c === CU) throw new NeedFallback();
+    rowBuf[ro++] = BS; rowBuf[ro++] = c; i += 2;
   }
-  let i = rs + 2;
-  let closed = -1;
-  let segStart = i;
-  while (i < re) {
-    if (raw[i] === BS) {
-      const nb = raw[i + 1];
-      if (nb === DQ) {
-        if (raw[i + 2] === BS && raw[i + 3] === DQ) {
-          value += raw.toString('utf8', segStart, i);
-          value += '"';
-          i += 4;
-          segStart = i;
-          continue;
-        }
-        closed = i;
-        break;
-      }
-      if (nb === NL) {
-        value += raw.toString('utf8', segStart, i);
-        value += '\n';
-        i += 2;
-        segStart = i;
-        continue;
-      }
-      if (nb === CRB) {
-        value += raw.toString('utf8', segStart, i);
-        value += '\n';
-        i += (raw[i + 2] === BS && raw[i + 3] === NL) ? 4 : 2;
-        segStart = i;
-        continue;
-      }
-      if (nb === BS) { i += 2; continue; }
-      if (nb === 0x75) { i += 6; continue; }
-      if (nb === 0x74 || nb === 0x62 || nb === 0x66 || nb === 0x2f) { i += 2; continue; }
-      throw new NeedFallback();
-    }
-    i++;
-  }
-  if (closed === -1) {
-    value = '"';
-    let j = rs + 2;
-    while (j < re) {
-      if (raw[j] === BS) {
-        const nb = raw[j + 1];
-        if (nb === DQ) { value += '"'; j += 2; }
-        else if (nb === NL) { value += '\n'; j += 2; }
-        else if (nb === CRB) { j += 2; }
-        else if (nb === BS) { value += '\\'; j += 2; }
-        else if (nb === 0x75) {
-          value += String.fromCharCode(parseInt(raw.toString('utf8', j + 2, j + 6), 16));
-          j += 6;
-        } else if (nb === 0x74) { value += '\t'; j += 2; }
-        else if (nb === 0x62) { value += '\b'; j += 2; }
-        else if (nb === 0x66) { value += '\f'; j += 2; }
-        else if (nb === 0x2f) { value += '/'; j += 2; }
-        else throw new NeedFallback();
-      } else {
-        let k = j;
-        while (k < re && raw[k] !== BS) k++;
-        value += raw.toString('utf8', j, k);
-        j = k;
-      }
-    }
-    return JSON.stringify(value);
-  }
-  value += raw.toString('utf8', segStart, closed);
-  let j = closed + 2;
-  while (j < re) {
-    if (raw[j] === BS) {
-      const nb = raw[j + 1];
-      if (nb === DQ) { value += '"'; j += 2; }
-      else if (nb === NL) { value += '\n'; j += 2; }
-      else if (nb === CRB) { j += 2; }
-      else if (nb === BS) { value += '\\'; j += 2; }
-      else if (nb === 0x75) {
-        value += String.fromCharCode(parseInt(raw.toString('utf8', j + 2, j + 6), 16));
-        j += 6;
-      } else if (nb === 0x74) { value += '\t'; j += 2; }
-      else if (nb === 0x62) { value += '\b'; j += 2; }
-      else if (nb === 0x66) { value += '\f'; j += 2; }
-      else if (nb === 0x2f) { value += '/'; j += 2; }
-      else throw new NeedFallback();
-    } else {
-      let k = j;
-      while (k < re && raw[k] !== BS) k++;
-      value += raw.toString('utf8', j, k);
-      j = k;
-    }
-  }
-  return JSON.stringify(value);
+  return [ro, dirty];
 }
 
-// Emit one field's JSON value to out at o.
-// cs/ce are the fast-copy content range; rs/re + quoted are for slow decode.
-function emitField(raw, cs, ce, rs, re, quoted, slow, out, o) {
-  if (slow) {
-    const fj = slowFieldJSON(raw, rs, re, quoted);
-    return o + out.write(fj, o, 'utf8');
+// --- salin nilai field ber-quote raw[vs..ve) ke rowBuf di ro.
+// Menangani "" -> " dan \r / \r\n di dalam quote -> \n (byte 0x0A).
+// (Di sini \n sudah jadi LF lewat jalur lain; yang ditangani: "" dan CR.)
+function copyQuotedSlow(raw, vs, ve, ro) {
+  let i = vs;
+  while (i < ve) {
+    const b = raw[i];
+    if (b !== BS) { rowBuf[ro++] = b; i++; continue; }
+    const c = raw[i + 1];
+    // Output adalah JSON: " \ LF harus dalam bentuk escape.
+    if (c === QT) {
+      // \"\" (doubled) -> \" (satu " , JSON-escaped)
+      rowBuf[ro++] = BS; rowBuf[ro++] = QT;
+      if (raw[i + 2] === BS && raw[i + 3] === QT) i += 4;
+      else i += 2;
+      continue;
+    }
+    if (c === CR) {
+      // \r atau \r\n di dalam quote -> \n (JSON escape untuk LF)
+      rowBuf[ro++] = BS; rowBuf[ro++] = CN;
+      if (raw[i + 2] === BS && raw[i + 3] === CN) i += 4;
+      else i += 2;
+      continue;
+    }
+    if (c === CN) { rowBuf[ro++] = BS; rowBuf[ro++] = CN; i += 2; continue; } // \n -> \n
+    if (c === BS) { rowBuf[ro++] = BS; rowBuf[ro++] = BS; i += 2; continue; } // \\ -> \\
+    if (c === CU) throw new NeedFallback();
+    rowBuf[ro++] = BS; rowBuf[ro++] = c; i += 2;
   }
-  out[o++] = DQ;
-  o = copyRange(raw, cs, ce, out, o);
-  out[o++] = DQ;
-  return o;
+  return ro;
 }
 
-// Transcode one case. Returns the new write position. Throws NeedFallback.
-export function transcodeCase(raw, scanner, ts, te, header, out, o) {
-  const { u32, alignBase } = scanner;
+// E_*: akhir field
+const E_COMMA = 0;
+const E_BREAK = 1;
+const E_END = 2;
+
+// --- transcode satu case. raw = cases.json utuh; [ts,te) = teks JSON-escaped.
+// header = boolean. out = buffer output; o = offset tulis. Return o baru.
+// Output: {"columns":...,"rows":[...],"errors":[...]}
+export function transcodeCase(raw, u32, ts, te, header, out, o) {
+  // warm-up jalur dingin sekali per proses (supaya call-site punya feedback)
+  if (!warmed) {
+    warmed = true;
+    try {
+      errSimple(0, 'x', 1, 0);
+      errShort(0, 1, 0, 0);
+      errLong(0, 1, 0, 0, 0);
+      copyQuotedSlow(raw, ts, ts, 0);
+      copyUnquotedSlow(raw, ts, ts, 0);
+    } catch (e) { /* abaikan */ }
+  }
+
   let p = ts;
-  if (p + 2 < te && raw[p] === 0xef && raw[p + 1] === 0xbb && raw[p + 2] === 0xbf) p += 3;
+  // BOM: UTF-8 (EF BB BF) atau escape \uFEFF
+  if (raw[p] === 0xEF && raw[p + 1] === 0xBB && raw[p + 2] === 0xBF) p += 3;
+  else if (raw[p] === BS && raw[p + 1] === CU && raw[p + 2] === 0x46 && raw[p + 3] === 0x45 && raw[p + 4] === 0x46 && raw[p + 5] === 0x46) p += 6;
 
   let line = 1;
   let width = -1;
-  let rowsEmitted = 0;
-  let errors = '';
-  let errorsN = 0;
+  let rowCount = 0;
+  let eo = 0;
+  let rowsStarted = false;
 
-  // {"columns":
-  out[o++] = 0x7b;
-  out[o++] = DQ; out[o++] = 0x63; out[o++] = 0x6f; out[o++] = 0x6c; out[o++] = 0x75; out[o++] = 0x6d; out[o++] = 0x6e; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a;
-  let needColumns = false;
-  let rowsOpen = false;
-  let firstRow = true;
-  if (!header) {
-    out[o++] = 0x6e; out[o++] = 0x75; out[o++] = 0x6c; out[o++] = 0x6c;
-    out[o++] = CM; out[o++] = DQ; out[o++] = 0x72; out[o++] = 0x6f; out[o++] = 0x77; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a; out[o++] = 0x5b;
-    rowsOpen = true;
-  } else {
-    needColumns = true;
-  }
+  out.set(L_COLS, o); o += L_COLS.length;
 
-  // Main record loop.
+  // ================= record loop =================
   while (true) {
+    // lewati baris kosong (LF / CRLF) di antara record
     while (p < te) {
-      if (raw[p] === BS && raw[p + 1] === NL) { p += 2; line++; }
-      else if (raw[p] === BS && raw[p + 1] === CRB && raw[p + 2] === BS && raw[p + 3] === NL) { p += 4; line++; }
-      else break;
+      if (raw[p] === BS && raw[p + 1] === CN) { line++; p += 2; continue; }
+      if (raw[p] === BS && raw[p + 1] === CR) {
+        if (raw[p + 2] === BS && raw[p + 3] === CN) { line++; p += 4; continue; }
+        break;
+      }
+      break;
     }
     if (p >= te) break;
 
     const recordLine = line;
-    const recordIsColumns = header && needColumns;
-    const recordRow = recordIsColumns ? null : rowsEmitted;
-
-    // Open the record array in the output.
-    if (recordIsColumns) {
-      // columns array opens right after {"columns":
-      out[o++] = 0x5b;
-    } else {
-      if (!rowsOpen) {
-        out[o++] = CM; out[o++] = DQ; out[o++] = 0x72; out[o++] = 0x6f; out[o++] = 0x77; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a; out[o++] = 0x5b;
-        rowsOpen = true;
-        firstRow = true;
-      }
-      if (!firstRow) out[o++] = CM;
-      firstRow = false;
-      out[o++] = 0x5b;
-    }
-
-    // Parse + emit this record's fields directly.
+    const recordRow = (width < 0 && header) ? null : rowCount;
     let fieldCount = 0;
-    let fieldStart = p;
-    let extraJson = '';
-    let extraN = 0;
-    let firstFieldEmpty = false;
-    let firstFieldQuoted = false;
-    // Remember where this record's '[' is, so a discarded record can be
-    // rewound (only the separator/comma bookkeeping matters: the record
-    // is the last thing written, so rewind o to the '[' position).
-    const recOpenPos = o - 1;
+    let ro = 0;
+    let lastFieldEmpty = false;
+    let lastQuoted = false;
 
+    // ================= field loop =================
+    let ended = E_END;
     while (true) {
-      const quoted = raw[fieldStart] === BS && raw[fieldStart + 1] === DQ;
-      let slow = false;
-      let cs, ce, rs, re;
-      let endKind; // 0 comma, 1 line break, 2 END
-      if (!quoted) {
-        rs = fieldStart;
-        let scan = fieldStart;
-        let endPos = -1;
+      const fieldStart = p;
+      const isQuoted = raw[p] === BS && raw[p + 1] === QT;
+      let fEnd = -1; // akhir field di rowBuf (setelah '"')
+      let fe = -1;   // akhir field di raw (posisi delimiter)
+      let e2 = E_END;
+
+      if (isQuoted) {
+        const openLine = line;
+        const vs = p + 2;
+        let q = vs;
+        let hasDouble = false;
+        let hasCR = false;
+        let ve = -1;
+        let closed = false;
         while (true) {
-          const d = findDelim(raw, u32, alignBase, scan, te);
-          if (d >= te) { endPos = te; endKind = 2; break; }
-          if (raw[d] === CM) { endPos = d; endKind = 0; break; }
-          const nb = raw[d + 1];
-          if (nb === NL) { endPos = d; endKind = 1; break; }
-          if (nb === CRB) {
-            const isCRLF = raw[d + 2] === BS && raw[d + 3] === NL;
-            if (isCRLF) { endPos = d; endKind = 1; break; }
-            errors += (errorsN++ ? ',' : '') + '{"code":"stray_cr","line":' + recordLine + ',"row":' + recordRow + '}';
-            slow = true;
-            scan = d + 2;
+          q = findBS(raw, u32, q, te);
+          if (q >= te) break;
+          const c = raw[q + 1];
+          if (c === QT) {
+            if (raw[q + 2] === BS && raw[q + 3] === QT) { hasDouble = true; q = q + 4; continue; }
+            ve = q; closed = true; p = q + 2; break;
+          }
+          if (c === CN) { line++; q = q + 2; continue; }
+          if (c === CR) {
+            hasCR = true; line++;
+            if (raw[q + 2] === BS && raw[q + 3] === CN) q = q + 4;
+            else q = q + 2;
             continue;
           }
-          if (nb === DQ) { scan = d + 2; continue; }
-          throw new NeedFallback();
+          if (c === CU) throw new NeedFallback();
+          q = q + 2;
         }
-        cs = fieldStart;
-        ce = endPos;
-        re = endPos;
-        // Emit this field (or collect into extra when over width).
-        if (fieldCount === 0) { firstFieldEmpty = (fieldStart === endPos); firstFieldQuoted = false; }
-        if (!recordIsColumns && width >= 0 && fieldCount >= width) {
-          const fj = slow ? slowFieldJSON(raw, rs, re, false) : '"' + raw.toString('utf8', cs, ce) + '"';
-          if (extraN > 0) extraJson += ',';
-          extraJson += fj;
-          extraN++;
+        if (!closed) {
+          // ---------- unterminated_quote (jalur lambat) ----------
+          eo = errSimple(eo, 'unterminated_quote', recordLine, recordRow);
+          line = openLine;
+          rowBuf[ro++] = QT; // opening " field
+          rowBuf[ro++] = BS; rowBuf[ro++] = QT; // '"' literal (escaped)
+          let dirty = false;
+          let fe2 = te;
+          let e3 = E_END;
+          let q2 = fieldStart + 2;
+          while (true) {
+            q2 = findDelim(raw, u32, q2, te);
+            if (q2 >= te) { fe2 = te; e3 = E_END; p = te; break; }
+            if (raw[q2] === CM) { fe2 = q2; e3 = E_COMMA; p = q2 + 1; break; }
+            const c2 = raw[q2 + 1];
+            if (c2 === CN) { fe2 = q2; e3 = E_BREAK; line++; p = q2 + 2; break; }
+            if (c2 === CR) {
+              if (raw[q2 + 2] === BS && raw[q2 + 3] === CN) { fe2 = q2; e3 = E_BREAK; line++; p = q2 + 4; break; }
+              eo = errSimple(eo, 'stray_cr', recordLine, recordRow);
+              dirty = true;
+              q2 = q2 + 2;
+              continue;
+            }
+            if (c2 === CU) throw new NeedFallback();
+            q2 = q2 + 2;
+          }
+          // salin sisa field sebagai unquoted (dari setelah quote pembuka)
+          const r0 = ro;
+          let hasEsc = false;
+          for (let i = fieldStart + 2; i < fe2; i++) if (raw[i] === BS) { hasEsc = true; break; }
+          if (!hasEsc) ro = copyRaw(raw, fieldStart + 2, fe2, ro);
+          else {
+            const res = copyUnquotedSlow(raw, fieldStart + 2, fe2, ro);
+            ro = res[0];
+            if (res[1]) dirty = true;
+          }
+          void dirty;
+          // field = '"' + sisa (sudah di rowBuf)
+          rowBuf[ro++] = QT;
+          fEnd = ro;
+          fe = fe2; e2 = e3;
+          lastFieldEmpty = false; lastQuoted = true;
         } else {
-          if (fieldCount > 0) out[o++] = CM;
-          o = emitField(raw, cs, ce, rs, re, false, slow, out, o);
+          // ---------- quoted tertutup ----------
+          // salin nilai (closing quote DITULIS SETELAH junk — junk bagian dari nilai)
+          rowBuf[ro++] = QT;
+          if (!hasDouble && !hasCR) ro = copyRaw(raw, vs, ve, ro);
+          else ro = copyQuotedSlow(raw, vs, ve, ro);
+          // quote_junk: karakter sampai koma / line break ditempel apa adanya
+          const junkFieldStart = p;
+          let junkHasCR = false;
+          while (true) {
+            const j = findDelim(raw, u32, p, te);
+            if (j >= te) { p = te; e2 = E_END; fe = te; break; }
+            if (raw[j] === CM) { fe = j; e2 = E_COMMA; p = j + 1; break; }
+            // raw[j] === BS: escape
+            const c = raw[j + 1];
+            if (c === CN) { fe = j; e2 = E_BREAK; line++; p = j + 2; break; }
+            if (c === CR) {
+              if (raw[j + 2] === BS && raw[j + 3] === CN) { fe = j; e2 = E_BREAK; line++; p = j + 4; break; }
+              // stray CR di junk: buang + error (sebelum quote_junk)
+              eo = errSimple(eo, 'stray_cr', recordLine, recordRow);
+              junkHasCR = true;
+              // salin junk sebelum CR, lalu lanjut setelah CR
+              const jr0 = ro;
+              void jr0;
+              p = j + 2;
+              continue;
+            }
+            if (c === CU) throw new NeedFallback();
+            p = j + 2;
+          }
+          // salin junk (bila ada) — dari posisi setelah closing quote sampai fe,
+          // dengan escape ditangani (\" -> ", \\ -> \, \r dibuang)
+          const junkStart = junkFieldStart;
+          const junkEnd = fe;
+          const roBeforeJunk = ro;
+          if (junkEnd > junkStart) {
+            // ada junk: proses byte-per-byte (jalur lambat, jarang)
+            let ji = junkStart;
+            let hasEsc = false;
+            for (let i = ji; i < junkEnd; i++) if (raw[i] === BS) { hasEsc = true; break; }
+            if (!hasEsc) {
+              for (let i = ji; i < junkEnd; i++) rowBuf[ro++] = raw[i];
+            } else {
+              while (ji < junkEnd) {
+                const b = raw[ji];
+                if (b !== BS) { rowBuf[ro++] = b; ji++; continue; }
+                const c = raw[ji + 1];
+                if (c === CN) { rowBuf[ro++] = BS; rowBuf[ro++] = CN; ji += 2; continue; }
+                if (c === CR) { ji += 2; continue; } // stray CR dibuang
+                if (c === BS) { rowBuf[ro++] = BS; rowBuf[ro++] = BS; ji += 2; continue; }
+                if (c === QT) { rowBuf[ro++] = BS; rowBuf[ro++] = QT; ji += 2; continue; }
+                if (c === CU) throw new NeedFallback();
+                rowBuf[ro++] = BS; rowBuf[ro++] = c; ji += 2;
+              }
+            }
+            if (ro > roBeforeJunk) eo = errSimple(eo, 'quote_junk', recordLine, recordRow);
+          }
+          void junkHasCR;
+          rowBuf[ro++] = QT; // closing quote (setelah junk)
+          fEnd = ro;
+          lastFieldEmpty = false; lastQuoted = true;
         }
-        fieldCount++;
-        if (endKind === 0) { fieldStart = endPos + 1; continue; }
-        if (endKind === 1) {
-          if (raw[endPos + 1] === NL) { p = endPos + 2; line++; }
-          else { p = endPos + 4; line++; }
-        } else { p = te; }
-        break;
+      } else {
+        // ---------- unquoted ----------
+        let q = fieldStart;
+        let dirty = false;
+        let fe2 = te;
+        let e3 = E_END;
+        while (true) {
+          q = findDelim(raw, u32, q, te);
+          if (q >= te) { fe2 = te; e3 = E_END; p = te; break; }
+          if (raw[q] === CM) { fe2 = q; e3 = E_COMMA; p = q + 1; break; }
+          const c = raw[q + 1];
+          if (c === CN) { fe2 = q; e3 = E_BREAK; line++; p = q + 2; break; }
+          if (c === CR) {
+            if (raw[q + 2] === BS && raw[q + 3] === CN) { fe2 = q; e3 = E_BREAK; line++; p = q + 4; break; }
+            eo = errSimple(eo, 'stray_cr', recordLine, recordRow);
+            dirty = true;
+            q = q + 2;
+            continue;
+          }
+          if (c === CU) throw new NeedFallback();
+          q = q + 2;
+        }
+        // salin field
+        rowBuf[ro++] = QT;
+        let hasEsc = false;
+        for (let i = fieldStart; i < fe2; i++) if (raw[i] === BS) { hasEsc = true; break; }
+        if (!hasEsc) ro = copyRaw(raw, fieldStart, fe2, ro);
+        else {
+          const res = copyUnquotedSlow(raw, fieldStart, fe2, ro);
+          ro = res[0];
+          if (res[1]) dirty = true;
+        }
+        void dirty;
+        rowBuf[ro++] = QT;
+        fEnd = ro;
+        fe = fe2; e2 = e3;
+        lastFieldEmpty = (fe2 === fieldStart);
+        lastQuoted = false;
       }
 
-      // Quoted field.
-      rs = fieldStart;
-      const openLine = line;
-      let scan = fieldStart + 2;
-      let contentEnd = -1;
-      let closePos = -1;
-      let unterminated = false;
-      while (true) {
-        const d = findDelim(raw, u32, alignBase, scan, te);
-        if (d >= te) { unterminated = true; break; }
-        if (raw[d] === CM) { scan = d + 1; continue; }
-        const nb = raw[d + 1];
-        if (nb === DQ) {
-          const doubled = raw[d + 2] === BS && raw[d + 3] === DQ;
-          if (doubled) { slow = true; scan = d + 4; continue; }
-          closePos = d;
-          contentEnd = d;
-          break;
-        }
-        if (nb === NL) { slow = true; line++; scan = d + 2; continue; }
-        if (nb === CRB) {
-          slow = true; line++;
-          scan = (raw[d + 2] === BS && raw[d + 3] === NL) ? d + 4 : d + 2;
-          continue;
-        }
-        throw new NeedFallback();
-      }
-      if (unterminated) {
-        errors += (errorsN++ ? ',' : '') + '{"code":"unterminated_quote","line":' + recordLine + ',"row":' + recordRow + '}';
-        line = openLine;
-        let scan2 = fieldStart + 2;
-        let endPos = -1;
-        let endKind2 = 2;
-        while (true) {
-          const d = findDelim(raw, u32, alignBase, scan2, te);
-          if (d >= te) { endPos = te; endKind2 = 2; break; }
-          if (raw[d] === CM) { endPos = d; endKind2 = 0; break; }
-          const nb = raw[d + 1];
-          if (nb === NL) { endPos = d; endKind2 = 1; break; }
-          if (nb === CRB) {
-            const isCRLF = raw[d + 2] === BS && raw[d + 3] === NL;
-            if (isCRLF) { endPos = d; endKind2 = 1; break; }
-            errors += (errorsN++ ? ',' : '') + '{"code":"stray_cr","line":' + recordLine + ',"row":' + recordRow + '}';
-            slow = true;
-            scan2 = d + 2;
-            continue;
-          }
-          if (nb === DQ) { scan2 = d + 2; continue; }
-          throw new NeedFallback();
-        }
-        cs = fieldStart; ce = endPos; re = endPos;
-        if (fieldCount === 0) { firstFieldEmpty = false; firstFieldQuoted = true; }
-        if (!recordIsColumns && width >= 0 && fieldCount >= width) {
-          const fj = slowFieldJSON(raw, rs, re, true);
-          if (extraN > 0) extraJson += ',';
-          extraJson += fj;
-          extraN++;
-        } else {
-          if (fieldCount > 0) out[o++] = CM;
-          o = emitField(raw, cs, ce, rs, re, true, true, out, o);
-        }
-        fieldCount++;
-        if (endKind2 === 0) { fieldStart = endPos + 1; continue; }
-        if (endKind2 === 1) {
-          if (raw[endPos + 1] === NL) { p = endPos + 2; line++; }
-          else { p = endPos + 4; line++; }
-        } else { p = te; }
-        break;
-      }
-      cs = fieldStart + 2;
-      ce = contentEnd;
-      let after = closePos + 2;
-      let endPos = -1;
-      endKind = 2;
-      let hasJunk = false;
-      if (after >= te) {
-        endPos = te; endKind = 2;
-      } else if (raw[after] === CM) {
-        endPos = after; endKind = 0;
-      } else if (raw[after] === BS && raw[after + 1] === NL) {
-        endPos = after; endKind = 1;
-      } else if (raw[after] === BS && raw[after + 1] === CRB && raw[after + 2] === BS && raw[after + 3] === NL) {
-        endPos = after; endKind = 1;
-      } else {
-        hasJunk = true;
-        slow = true;
-        let scan2 = after;
-        while (true) {
-          const d = findDelim(raw, u32, alignBase, scan2, te);
-          if (d >= te) { endPos = te; endKind = 2; break; }
-          if (raw[d] === CM) { endPos = d; endKind = 0; break; }
-          const nb = raw[d + 1];
-          if (nb === NL) { endPos = d; endKind = 1; break; }
-          if (nb === CRB) {
-            const isCRLF = raw[d + 2] === BS && raw[d + 3] === NL;
-            if (isCRLF) { endPos = d; endKind = 1; break; }
-            errors += (errorsN++ ? ',' : '') + '{"code":"stray_cr","line":' + recordLine + ',"row":' + recordRow + '}';
-            scan2 = d + 2;
-            continue;
-          }
-          if (nb === DQ) { scan2 = d + 2; continue; }
-          throw new NeedFallback();
-        }
-      }
-      re = endPos;
-      if (fieldCount === 0) { firstFieldEmpty = false; firstFieldQuoted = true; }
-      if (hasJunk) {
-        let junkLen = endPos - after;
-        let k = after;
-        let stray = 0;
-        while (k < endPos) {
-          if (raw[k] === BS && raw[k + 1] === CRB) {
-            const isCRLF = raw[k + 2] === BS && raw[k + 3] === NL;
-            if (!isCRLF) { stray++; k += 2; continue; }
-          }
-          k++;
-        }
-        junkLen -= stray * 2;
-        if (junkLen > 0) {
-          errors += (errorsN++ ? ',' : '') + '{"code":"quote_junk","line":' + recordLine + ',"row":' + recordRow + '}';
-        }
-      }
-      if (!recordIsColumns && width >= 0 && fieldCount >= width) {
-        const fj = slowFieldJSON(raw, rs, re, true);
-        if (extraN > 0) extraJson += ',';
-        extraJson += fj;
-        extraN++;
-      } else {
-        if (fieldCount > 0) out[o++] = CM;
-        o = emitField(raw, cs, ce, rs, re, true, slow, out, o);
-      }
+      // simpan field
+      if (fieldCount > 0) { /* pemisah antar field sudah implisit: tiap field ditulis berurutan; koma disisipkan di bawah */ }
+      fieldEnds[fieldCount] = fEnd;
       fieldCount++;
-      if (endKind === 0) { fieldStart = endPos + 1; continue; }
-      if (endKind === 1) {
-        if (raw[endPos + 1] === NL) { p = endPos + 2; line++; }
-        else { p = endPos + 4; line++; }
-      } else { p = te; }
-      break;
+      ended = e2;
+      if (ended !== E_COMMA) break;
+      // field berikutnya: sisipkan koma di rowBuf sebelum field berikut ditulis
+      // (ditandai lewat fieldEnds: kita tulis koma sekarang)
+      rowBuf[ro++] = CM;
     }
 
-    // Close the record array.
-    out[o++] = 0x5d; // ]
+    // ---- record selesai ----
+    // buang record = satu field unquoted kosong (tapi stray_cr tetap)
+    if (fieldCount === 1 && lastFieldEmpty && !lastQuoted) continue;
 
-    // Discard rule: one empty unquoted field -> rewind the record.
-    // (Applies to the columns record too: it stays "needed" and the next
-    // record becomes the columns, matching the reference.)
-    if (fieldCount === 1 && firstFieldEmpty && !firstFieldQuoted) {
-      // Rewind o to before the record's '['. If a ',' separator was
-      // written before it (not the first row), remove that too.
-      if (out[recOpenPos - 1] === CM) {
-        o = recOpenPos - 1;
-        // firstRow stays false: earlier rows still exist.
-      } else {
-        o = recOpenPos;
-        firstRow = true; // no rows written yet.
+    if (width < 0) {
+      width = fieldCount;
+      if (header && !rowsStarted) {
+        // kolom = record pertama; emit kolom: [field...]
+        out[o++] = 0x5B;
+        out.set(rowBuf.subarray(0, fieldEnds[fieldCount - 1]), o);
+        o += fieldEnds[fieldCount - 1];
+        out[o++] = 0x5D;
+        out.set(L_ROWS, o); o += L_ROWS.length;
+        rowsStarted = true;
+        continue;
       }
-      continue;
+      // bukan header: kolom = null, lalu record ini jadi baris pertama
+      out.set(L_NULL, o); o += L_NULL.length;
+      out.set(L_ROWS, o); o += L_ROWS.length;
+      rowsStarted = true;
     }
-    if (recordIsColumns) {
-      if (width < 0) width = fieldCount;
-      needColumns = false;
-      out[o++] = CM; out[o++] = DQ; out[o++] = 0x72; out[o++] = 0x6f; out[o++] = 0x77; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a; out[o++] = 0x5b;
-      rowsOpen = true;
-      firstRow = true;
-      continue;
+    // emit baris
+    if (rowCount > 0) out[o++] = CM;
+    out[o++] = 0x5B;
+    if (fieldCount === width) {
+      out.set(rowBuf.subarray(0, fieldEnds[fieldCount - 1]), o);
+      o += fieldEnds[fieldCount - 1];
+    } else if (fieldCount < width) {
+      // short_row: pad ""
+      eo = errShort(eo, recordLine, recordRow, fieldCount);
+      out.set(rowBuf.subarray(0, fieldEnds[fieldCount - 1]), o);
+      o += fieldEnds[fieldCount - 1];
+      for (let k = fieldCount; k < width; k++) {
+        out[o++] = CM;
+        out[o++] = QT; out[o++] = QT;
+      }
+    } else {
+      // long_row: potong ke width; extra = field selebihnya
+      const extraLo = fieldEnds[width - 1] + 1; // setelah koma sesudah field ke-width
+      const extraHi = fieldEnds[fieldCount - 1];
+      eo = errLong(eo, recordLine, recordRow, extraLo, extraHi);
+      out.set(rowBuf.subarray(0, fieldEnds[width - 1]), o);
+      o += fieldEnds[width - 1];
     }
-    if (width < 0) width = fieldCount;
-    if (fieldCount < width) {
-      errors += (errorsN++ ? ',' : '') + '{"code":"short_row","line":' + recordLine + ',"row":' + recordRow + ',"fields":' + fieldCount + '}';
-      // Pad: back up over ']' and append ,"",... then ']'.
-      o -= 1;
-      for (let f = fieldCount; f < width; f++) { out[o++] = CM; out[o++] = DQ; out[o++] = DQ; }
-      out[o++] = 0x5d;
-    } else if (fieldCount > width) {
-      errors += (errorsN++ ? ',' : '') + '{"code":"long_row","line":' + recordLine + ',"row":' + recordRow + ',"extra":[' + extraJson + ']}';
-    }
-    rowsEmitted++;
+    out[o++] = 0x5D;
+    rowCount++;
   }
 
-  // Close the case JSON.
-  if (needColumns) {
-    out[o++] = 0x5b; out[o++] = 0x5d;
+  // tidak ada record non-discarded sama sekali
+  if (width < 0) {
+    width = 0;
+    if (header) {
+      out[o++] = 0x5B; out[o++] = 0x5D; // []
+    } else {
+      out.set(L_NULL, o); o += L_NULL.length;
+    }
+    out.set(L_ROWS, o); o += L_ROWS.length;
+    rowsStarted = true;
   }
-  if (!rowsOpen) {
-    out[o++] = CM; out[o++] = DQ; out[o++] = 0x72; out[o++] = 0x6f; out[o++] = 0x77; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a; out[o++] = 0x5b;
+  out.set(L_ERRS, o); o += L_ERRS.length;
+  if (eo > 0) {
+    out.set(errBuf.subarray(0, eo), o); o += eo;
   }
-  out[o++] = 0x5d; out[o++] = CM; out[o++] = DQ; out[o++] = 0x65; out[o++] = 0x72; out[o++] = 0x72; out[o++] = 0x6f; out[o++] = 0x72; out[o++] = 0x73; out[o++] = DQ; out[o++] = 0x3a; out[o++] = 0x5b;
-  o += out.write(errors, o, 'utf8');
-  out[o++] = 0x5d;
-  out[o++] = 0x7d;
+  out.set(L_END, o); o += L_END.length;
   return o;
 }
